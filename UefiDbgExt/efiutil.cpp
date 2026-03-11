@@ -15,6 +15,592 @@ Abstract:
 --*/
 
 #include "uefiext.h"
+#include <winnt.h>
+
+#pragma pack(push, 1)
+typedef struct {
+  UINT16                  Signature;
+  UINT16                  Machine;
+  UINT8                   NumberOfSections;
+  UINT8                   Subsystem;
+  UINT16                  StrippedSize;
+  UINT32                  AddressOfEntryPoint;
+  UINT32                  BaseOfCode;
+  UINT64                  ImageBase;
+  IMAGE_DATA_DIRECTORY    DataDirectory[2];
+} EFI_TE_IMAGE_HEADER;
+
+typedef union {
+  struct {
+    UINT8    Header;
+    UINT8    File;
+  } Checksum;
+  UINT16    Checksum16;
+} EFI_FFS_INTEGRITY_CHECK;
+
+typedef struct {
+  GUID                       Name;
+  EFI_FFS_INTEGRITY_CHECK    IntegrityCheck;
+  UINT8                      Type;
+  UINT8                      Attributes;
+  UINT8                      Size[3];
+  UINT8                      State;
+} EFI_FFS_FILE_HEADER;
+
+typedef struct {
+  EFI_FFS_FILE_HEADER    Header;
+  UINT32                 ExtendedSize;
+} EFI_FFS_FILE_HEADER2;
+
+typedef struct {
+  UINT8     ZeroVector[16];
+  GUID      FileSystemGuid;
+  UINT64    FvLength;
+  UINT32    Signature;
+  UINT32    Attributes;
+  UINT16    HeaderLength;
+  UINT16    Checksum;
+  UINT16    ExtHeaderOffset;
+  UINT8     Reserved[1];
+  UINT8     Revision;
+} EFI_FIRMWARE_VOLUME_HEADER;
+
+typedef struct {
+  GUID       FileGuid;
+  ULONG64    FileHeaderAddress;
+  UINT32     FileSize;
+  UINT8      Type;
+  UINT8      Attributes;
+  UINT8      State;
+  UINT8      HeaderChecksum;
+  UINT8      FileChecksum;
+  BOOLEAN    UsesExtendedSize;
+} FFS_FILE_INFO;
+#pragma pack(pop)
+
+#define EFI_TE_IMAGE_HEADER_SIGNATURE  0x5A56     // 'VZ'
+#define EFI_FVH_SIGNATURE              0x4856465F // '_FVH'
+
+static
+UINT32
+GetFfsFileSize (
+  IN UINT8  Size[3]
+  )
+{
+  return (UINT32)(Size[0] | (Size[1] << 8) | (Size[2] << 16));
+}
+
+static
+BOOLEAN
+IsGuidAllByte (
+  IN const GUID  *Value,
+  IN UINT8       Byte
+  )
+{
+  const UINT8  *GuidBytes;
+  ULONG        i;
+
+  GuidBytes = (const UINT8 *)Value;
+  for (i = 0; i < sizeof (GUID); i++) {
+    if (GuidBytes[i] != Byte) {
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
+static
+BOOLEAN
+TryGetContainingFfsFileInfo (
+  IN  ULONG64        ImageAddress,
+  OUT FFS_FILE_INFO  *FileInfo
+  )
+{
+  ULONG64                     MinAddress;
+  ULONG64                     FvBase;
+  ULONG64                     Address;
+  ULONG                       BytesRead;
+  EFI_FIRMWARE_VOLUME_HEADER  FvHeader;
+
+  if (FileInfo == NULL) {
+    return FALSE;
+  }
+
+  // Search backward for a firmware volume header signature (_FVH), then parse FFS files.
+  if (ImageAddress > 0x1000000) {
+    MinAddress = ImageAddress - 0x1000000;
+  } else {
+    MinAddress = 0;
+  }
+
+  FvBase  = 0;
+  Address = ImageAddress & ~(ULONG64)0x7;
+  for ( ; Address >= MinAddress; ) {
+    BytesRead = 0;
+    if (ReadMemory (Address, &FvHeader, sizeof (FvHeader), &BytesRead) && (BytesRead == sizeof (FvHeader))) {
+      if ((FvHeader.Signature == EFI_FVH_SIGNATURE) &&
+          (FvHeader.HeaderLength >= sizeof (EFI_FIRMWARE_VOLUME_HEADER)) &&
+          (FvHeader.FvLength >= FvHeader.HeaderLength) &&
+          (Address + FvHeader.FvLength > ImageAddress))
+      {
+        FvBase = Address;
+        break;
+      }
+    }
+
+    if (Address == MinAddress) {
+      break;
+    }
+
+    Address -= 0x8;
+  }
+
+  if (FvBase == 0) {
+    return FALSE;
+  }
+
+  {
+    ULONG64  FileAddress;
+    ULONG64  FvEnd;
+
+    FvEnd       = FvBase + FvHeader.FvLength;
+    FileAddress = (FvBase + FvHeader.HeaderLength + 7) & ~(ULONG64)0x7;
+
+    while ((FileAddress + sizeof (EFI_FFS_FILE_HEADER)) <= FvEnd) {
+      EFI_FFS_FILE_HEADER  Header;
+      UINT32               FileSize;
+      BOOLEAN              IsExtendedSize;
+      ULONG64              EndAddress;
+
+      BytesRead = 0;
+      if (!ReadMemory (FileAddress, &Header, sizeof (Header), &BytesRead) || (BytesRead != sizeof (Header))) {
+        break;
+      }
+
+      if ((Header.Type == 0xFF) && IsGuidAllByte (&Header.Name, 0xFF)) {
+        // Unused space in FV.
+        break;
+      }
+
+      FileSize       = GetFfsFileSize (Header.Size);
+      IsExtendedSize = FALSE;
+      if (FileSize == 0x00FFFFFF) {
+        EFI_FFS_FILE_HEADER2  Header2;
+
+        BytesRead = 0;
+        if (ReadMemory (FileAddress, &Header2, sizeof (Header2), &BytesRead) && (BytesRead == sizeof (Header2))) {
+          FileSize       = Header2.ExtendedSize;
+          IsExtendedSize = TRUE;
+        }
+      }
+
+      if ((FileSize < sizeof (EFI_FFS_FILE_HEADER)) || (FileSize == 0xFFFFFFFF)) {
+        break;
+      }
+
+      EndAddress = FileAddress + (ULONG64)FileSize;
+      if (EndAddress > FvEnd) {
+        break;
+      }
+
+      if ((FileAddress <= ImageAddress) && (ImageAddress < EndAddress) &&
+          (Header.Type != 0xFF) && !IsGuidAllByte (&Header.Name, 0x00) && !IsGuidAllByte (&Header.Name, 0xFF))
+      {
+        FileInfo->FileGuid          = Header.Name;
+        FileInfo->FileHeaderAddress = FileAddress;
+        FileInfo->FileSize          = FileSize;
+        FileInfo->Type              = Header.Type;
+        FileInfo->Attributes        = Header.Attributes;
+        FileInfo->State             = Header.State;
+        FileInfo->HeaderChecksum    = Header.IntegrityCheck.Checksum.Header;
+        FileInfo->FileChecksum      = Header.IntegrityCheck.Checksum.File;
+        FileInfo->UsesExtendedSize  = IsExtendedSize;
+        return TRUE;
+      }
+
+      FileAddress = (EndAddress + 7) & ~(ULONG64)0x7;
+    }
+  }
+
+  // Fallback heuristic for targets with partially mapped firmware memory.
+  Address = ImageAddress & ~(ULONG64)0x7;
+  if (ImageAddress > 0x20000) {
+    MinAddress = ImageAddress - 0x20000;
+  } else {
+    MinAddress = 0;
+  }
+
+  for ( ; Address >= MinAddress; ) {
+    UINT32               FileSize;
+    BOOLEAN              IsExtendedSize;
+    EFI_FFS_FILE_HEADER  Header;
+
+    BytesRead = 0;
+    if (!ReadMemory (Address, &Header, sizeof (Header), &BytesRead) || (BytesRead != sizeof (Header))) {
+      if (Address == MinAddress) {
+        break;
+      }
+
+      Address -= 0x8;
+      continue;
+    }
+
+    if ((Header.Type != 0xFF) && !IsGuidAllByte (&Header.Name, 0x00) && !IsGuidAllByte (&Header.Name, 0xFF)) {
+      FileSize       = GetFfsFileSize (Header.Size);
+      IsExtendedSize = FALSE;
+      if (FileSize == 0x00FFFFFF) {
+        EFI_FFS_FILE_HEADER2  Header2;
+
+        BytesRead = 0;
+        if (ReadMemory (Address, &Header2, sizeof (Header2), &BytesRead) && (BytesRead == sizeof (Header2))) {
+          FileSize       = Header2.ExtendedSize;
+          IsExtendedSize = TRUE;
+        }
+      }
+
+      if ((FileSize >= sizeof (EFI_FFS_FILE_HEADER)) && (FileSize != 0xFFFFFFFF)) {
+        ULONG64  EndAddress;
+
+        EndAddress = Address + (ULONG64)FileSize;
+        if ((Address <= ImageAddress) && (ImageAddress < EndAddress)) {
+          FileInfo->FileGuid          = Header.Name;
+          FileInfo->FileHeaderAddress = Address;
+          FileInfo->FileSize          = FileSize;
+          FileInfo->Type              = Header.Type;
+          FileInfo->Attributes        = Header.Attributes;
+          FileInfo->State             = Header.State;
+          FileInfo->HeaderChecksum    = Header.IntegrityCheck.Checksum.Header;
+          FileInfo->FileChecksum      = Header.IntegrityCheck.Checksum.File;
+          FileInfo->UsesExtendedSize  = IsExtendedSize;
+          return TRUE;
+        }
+      }
+    }
+
+    if (Address == MinAddress) {
+      break;
+    }
+
+    Address -= 0x8;
+  }
+
+  return FALSE;
+}
+
+static
+PCSTR
+FfsFileTypeToString (
+  IN UINT8  Type
+  )
+{
+  switch (Type) {
+    case 0x01:
+      return "RAW";
+    case 0x02:
+      return "FREEFORM";
+    case 0x03:
+      return "SECURITY_CORE";
+    case 0x04:
+      return "PEI_CORE";
+    case 0x05:
+      return "DXE_CORE";
+    case 0x06:
+      return "PEIM";
+    case 0x07:
+      return "DRIVER";
+    case 0x08:
+      return "COMBINED_PEIM_DRIVER";
+    case 0x09:
+      return "APPLICATION";
+    case 0x0A:
+      return "MM";
+    case 0x0B:
+      return "FIRMWARE_VOLUME_IMAGE";
+    case 0x0C:
+      return "COMBINED_MM_DXE";
+    case 0x0D:
+      return "MM_CORE";
+    case 0xF0:
+      return "FFS_PAD";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+static
+ULONG64
+GetCurrentIpOrPc (
+  VOID
+  )
+{
+  ULONG64  Address;
+
+  Address = 0;
+  if (g_TargetMachine == IMAGE_FILE_MACHINE_AMD64) {
+    Address = GetRegisterValue ("rip");
+  } else if (g_TargetMachine == IMAGE_FILE_MACHINE_ARM64) {
+    Address = GetRegisterValue ("pc");
+  }
+
+  if ((Address == 0) || (Address == (ULONG64)-1)) {
+    Address = GetExpression ("@$ip");
+  }
+
+  return Address;
+}
+
+static
+BOOLEAN
+IsValidTeHeader (
+  IN ULONG64  Address
+  )
+{
+  EFI_TE_IMAGE_HEADER  Header;
+  ULONG                BytesRead;
+
+  BytesRead = 0;
+  if (!ReadMemory (Address, &Header, sizeof (Header), &BytesRead) || (BytesRead != sizeof (Header))) {
+    return FALSE;
+  }
+
+  if (Header.Signature != EFI_TE_IMAGE_HEADER_SIGNATURE) {
+    return FALSE;
+  }
+
+  if ((Header.NumberOfSections == 0) || (Header.StrippedSize < sizeof (EFI_TE_IMAGE_HEADER))) {
+    return FALSE;
+  }
+
+  if ((Header.Machine != IMAGE_FILE_MACHINE_I386) &&
+      (Header.Machine != IMAGE_FILE_MACHINE_AMD64) &&
+      (Header.Machine != IMAGE_FILE_MACHINE_ARM64))
+  {
+    return FALSE;
+  }
+
+  if ((Header.Subsystem < IMAGE_SUBSYSTEM_EFI_APPLICATION) ||
+      (Header.Subsystem > IMAGE_SUBSYSTEM_EFI_ROM))
+  {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static
+BOOLEAN
+IsValidPeImage (
+  IN ULONG64  Address
+  )
+{
+  IMAGE_DOS_HEADER   DosHeader;
+  ULONG              BytesRead;
+  ULONG64            NtHeaderAddress;
+  ULONG              NtSignature;
+  IMAGE_FILE_HEADER  FileHeader;
+  UINT16             OptionalMagic;
+
+  BytesRead = 0;
+  if (!ReadMemory (Address, &DosHeader, sizeof (DosHeader), &BytesRead) || (BytesRead != sizeof (DosHeader))) {
+    return FALSE;
+  }
+
+  if (DosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+    return FALSE;
+  }
+
+  // PE header should be close to image start for firmware images.
+  if ((DosHeader.e_lfanew < sizeof (IMAGE_DOS_HEADER)) || (DosHeader.e_lfanew > 0x1000)) {
+    return FALSE;
+  }
+
+  NtHeaderAddress = Address + (ULONG64)DosHeader.e_lfanew;
+  NtSignature     = 0;
+  if (!ReadMemory (NtHeaderAddress, &NtSignature, sizeof (NtSignature), &BytesRead) || (BytesRead != sizeof (NtSignature))) {
+    return FALSE;
+  }
+
+  if (NtSignature != IMAGE_NT_SIGNATURE) {
+    return FALSE;
+  }
+
+  if (!ReadMemory (NtHeaderAddress + sizeof (NtSignature), &FileHeader, sizeof (FileHeader), &BytesRead) || (BytesRead != sizeof (FileHeader))) {
+    return FALSE;
+  }
+
+  if ((FileHeader.NumberOfSections == 0) || (FileHeader.NumberOfSections > 96)) {
+    return FALSE;
+  }
+
+  if (FileHeader.SizeOfOptionalHeader < sizeof (UINT16)) {
+    return FALSE;
+  }
+
+  OptionalMagic = 0;
+  if (!ReadMemory (NtHeaderAddress + sizeof (NtSignature) + sizeof (FileHeader), &OptionalMagic, sizeof (OptionalMagic), &BytesRead) || (BytesRead != sizeof (OptionalMagic))) {
+    return FALSE;
+  }
+
+  if ((OptionalMagic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) && (OptionalMagic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static
+BOOLEAN
+TryGetPePdbPath (
+  IN  ULONG64  Address,
+  OUT PCHAR    PdbPath,
+  IN  ULONG    PdbPathSize
+  )
+{
+  IMAGE_DOS_HEADER       DosHeader;
+  ULONG64                NtHeadersAddr;
+  ULONG                  BytesRead;
+  ULONG                  NtSignature;
+  IMAGE_FILE_HEADER      FileHeader;
+  UINT16                 OptionalMagic;
+  UINT32                 DebugDirRva;
+  UINT32                 DebugDirSize;
+  UINT32                 ImageSize;
+  ULONG                  NumEntries;
+  IMAGE_DEBUG_DIRECTORY  DebugEntries[32];
+  ULONG                  i;
+
+  if ((PdbPath == NULL) || (PdbPathSize < 2)) {
+    return FALSE;
+  }
+
+  PdbPath[0] = '\0';
+
+  BytesRead = 0;
+  if (!ReadMemory (Address, &DosHeader, sizeof (DosHeader), &BytesRead) || (BytesRead != sizeof (DosHeader))) {
+    return FALSE;
+  }
+
+  if (DosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+    return FALSE;
+  }
+
+  NtHeadersAddr = Address + (ULONG64)DosHeader.e_lfanew;
+  NtSignature   = 0;
+  if (!ReadMemory (NtHeadersAddr, &NtSignature, sizeof (NtSignature), &BytesRead) || (BytesRead != sizeof (NtSignature))) {
+    return FALSE;
+  }
+
+  if (NtSignature != IMAGE_NT_SIGNATURE) {
+    return FALSE;
+  }
+
+  if (!ReadMemory (NtHeadersAddr + sizeof (NtSignature), &FileHeader, sizeof (FileHeader), &BytesRead) || (BytesRead != sizeof (FileHeader))) {
+    return FALSE;
+  }
+
+  OptionalMagic = 0;
+  if (!ReadMemory (NtHeadersAddr + sizeof (NtSignature) + sizeof (FileHeader), &OptionalMagic, sizeof (OptionalMagic), &BytesRead) || (BytesRead != sizeof (OptionalMagic))) {
+    return FALSE;
+  }
+
+  DebugDirRva  = 0;
+  DebugDirSize = 0;
+  ImageSize    = 0;
+  if (OptionalMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    IMAGE_OPTIONAL_HEADER64  Optional64;
+
+    if (!ReadMemory (NtHeadersAddr + sizeof (NtSignature) + sizeof (FileHeader), &Optional64, sizeof (Optional64), &BytesRead) || (BytesRead != sizeof (Optional64))) {
+      return FALSE;
+    }
+
+    DebugDirRva  = Optional64.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress;
+    DebugDirSize = Optional64.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size;
+    ImageSize    = Optional64.SizeOfImage;
+  } else if (OptionalMagic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+    IMAGE_OPTIONAL_HEADER32  Optional32;
+
+    if (!ReadMemory (NtHeadersAddr + sizeof (NtSignature) + sizeof (FileHeader), &Optional32, sizeof (Optional32), &BytesRead) || (BytesRead != sizeof (Optional32))) {
+      return FALSE;
+    }
+
+    DebugDirRva  = Optional32.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress;
+    DebugDirSize = Optional32.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size;
+    ImageSize    = Optional32.SizeOfImage;
+  } else {
+    return FALSE;
+  }
+
+  if ((DebugDirRva == 0) || (DebugDirSize < sizeof (IMAGE_DEBUG_DIRECTORY))) {
+    return FALSE;
+  }
+
+  NumEntries = DebugDirSize / sizeof (IMAGE_DEBUG_DIRECTORY);
+  if (NumEntries > ARRAYSIZE (DebugEntries)) {
+    NumEntries = ARRAYSIZE (DebugEntries);
+  }
+
+  if (!ReadMemory (Address + DebugDirRva, DebugEntries, NumEntries * sizeof (IMAGE_DEBUG_DIRECTORY), &BytesRead) || (BytesRead != (NumEntries * sizeof (IMAGE_DEBUG_DIRECTORY)))) {
+    return FALSE;
+  }
+
+  for (i = 0; i < NumEntries; i++) {
+    IMAGE_DEBUG_DIRECTORY  *Entry;
+    ULONG64                CvAddress;
+    CHAR                   Signature[4];
+    ULONG                  CvHeaderSize;
+    ULONG64                PdbPathAddress;
+    ULONG                  SizeToRead;
+
+    Entry = &DebugEntries[i];
+    if (Entry->Type != IMAGE_DEBUG_TYPE_CODEVIEW) {
+      continue;
+    }
+
+    CvAddress = 0;
+    if ((Entry->AddressOfRawData != 0) && (ImageSize != 0) &&
+        ((ULONG64)Entry->AddressOfRawData >= Address) &&
+        ((ULONG64)Entry->AddressOfRawData < (Address + (ULONG64)ImageSize)))
+    {
+      CvAddress = (ULONG64)Entry->AddressOfRawData;
+    } else if (Entry->AddressOfRawData != 0) {
+      CvAddress = Address + (ULONG64)Entry->AddressOfRawData;
+    } else if (Entry->PointerToRawData != 0) {
+      CvAddress = Address + (ULONG64)Entry->PointerToRawData;
+    } else {
+      continue;
+    }
+
+    if (!ReadMemory (CvAddress, Signature, sizeof (Signature), &BytesRead) || (BytesRead != sizeof (Signature))) {
+      continue;
+    }
+
+    if (memcmp (Signature, "RSDS", 4) == 0) {
+      CvHeaderSize = 24;
+    } else if (memcmp (Signature, "NB10", 4) == 0) {
+      CvHeaderSize = 16;
+    } else {
+      continue;
+    }
+
+    PdbPathAddress = CvAddress + CvHeaderSize;
+    SizeToRead     = PdbPathSize - 1;
+    if ((Entry->SizeOfData > CvHeaderSize) && (Entry->SizeOfData - CvHeaderSize < SizeToRead)) {
+      SizeToRead = Entry->SizeOfData - CvHeaderSize;
+    }
+
+    if ((SizeToRead == 0) || !ReadMemory (PdbPathAddress, PdbPath, SizeToRead, &BytesRead) || (BytesRead == 0)) {
+      continue;
+    }
+
+    PdbPath[(BytesRead < (PdbPathSize - 1)) ? BytesRead : (PdbPathSize - 1)] = '\0';
+    if (PdbPath[0] != '\0') {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
 
 UINT64
 GetNextListEntry (
@@ -298,4 +884,100 @@ efierror (
 
   EXIT_API ();
   return S_OK;
+}
+
+HRESULT CALLBACK
+find_image (
+  PDEBUG_CLIENT4  Client,
+  PCSTR           args
+  )
+{
+  ULONG64        StartAddress;
+  ULONG64        Address;
+  ULONG64        MinAddress;
+  ULONG64        MaxSize;
+  CONST ULONG64  ScanStride = 0x4;
+  ULONG32        Check;
+  ULONG          BytesRead;
+  CONST UINT16   PeMagic = IMAGE_DOS_SIGNATURE;           // MZ
+  CONST UINT16   TeMagic = EFI_TE_IMAGE_HEADER_SIGNATURE; // VZ
+  CHAR           PdbPath[1024];
+  FFS_FILE_INFO  FileInfo;
+  HRESULT        hr = ERROR_NOT_FOUND;
+
+  INIT_API ();
+
+  if (strlen (args) == 0) {
+    Address = GetCurrentIpOrPc ();
+  } else {
+    Address = GetExpression (args);
+  }
+
+  if ((Address == 0) || (Address == (ULONG64)-1)) {
+    dprintf ("Invalid address!\n");
+    dprintf ("Usage: !uefiext.find_image [Address]\n");
+    hr = ERROR_INVALID_PARAMETER;
+    goto Cleanup;
+  }
+
+  StartAddress = Address;
+  Address     &= ~(ScanStride - 1);
+  MaxSize      = 0x100000; // 1 MB
+  if (Address > MaxSize) {
+    MinAddress = (Address - MaxSize) & ~(ScanStride - 1);
+  } else {
+    MinAddress = 0;
+  }
+
+  for ( ; Address >= MinAddress; ) {
+    Check = 0;
+    if (!ReadMemory (Address, &Check, sizeof (Check), &BytesRead) || (BytesRead != sizeof (Check))) {
+      break;
+    }
+
+    if ((Check & 0xFFFF) == PeMagic) {
+      if (IsValidPeImage (Address)) {
+        dprintf ("Found PE/COFF image at %llx\n", Address);
+        if (TryGetPePdbPath (Address, PdbPath, sizeof (PdbPath))) {
+          dprintf ("  PDB: %s\n", PdbPath);
+        } else {
+          dprintf ("  PDB: not found\n");
+          dprintf ("  try .reload /f <Module-Name>=%llx\n", Address);
+          if (TryGetContainingFfsFileInfo (Address, &FileInfo)) {
+            dprintf ("  FFS FILE_GUID at %llx: %s\n", FileInfo.FileHeaderAddress, GuidToString (&FileInfo.FileGuid));
+            dprintf ("  FFS type: 0x%02x (%s)\n", FileInfo.Type, FfsFileTypeToString (FileInfo.Type));
+            dprintf ("  FFS size: 0x%x (%u)%s\n", FileInfo.FileSize, FileInfo.FileSize, FileInfo.UsesExtendedSize ? " [extended]" : "");
+            dprintf ("  FFS attributes: 0x%02x\n", FileInfo.Attributes);
+            dprintf ("  FFS state: 0x%02x\n", FileInfo.State);
+            dprintf ("  FFS checksum: header=0x%02x file=0x%02x\n", FileInfo.HeaderChecksum, FileInfo.FileChecksum);
+          } else {
+            dprintf ("  FFS FILE_GUID: not found\n");
+          }
+        }
+
+        hr = S_OK;
+        goto Cleanup;
+      }
+    }
+
+    if ((Check & 0xFFFF) == TeMagic) {
+      if (IsValidTeHeader (Address)) {
+        dprintf ("Found TE image at %llx\n", Address);
+        hr = S_OK;
+        goto Cleanup;
+      }
+    }
+
+    if (Address == MinAddress) {
+      break;
+    }
+
+    Address -= ScanStride;
+  }
+
+  dprintf ("No PE/COFF or TE image found scanning backward from %llx\n", StartAddress);
+
+Cleanup:
+  EXIT_API ();
+  return hr;
 }
